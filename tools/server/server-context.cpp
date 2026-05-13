@@ -2543,7 +2543,23 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                if (pos_min >= pos_min_thold) {
+                                // The recovery branch below hunts for a checkpoint to restore from
+                                // and resets n_past=0 (forcing a full re-prefill) when none is found.
+                                // Only enter it when checkpoints actually exist for this slot — the
+                                // mirror of the creation gate further down. Without this mirror, models
+                                // that never create checkpoints (e.g. Gemma 4 with --swa-full, or any
+                                // dense model not in PART_BOUNDED / FULL seq_rm mode) pay an unnecessary
+                                // full re-prefill on every cache-reuse opportunity. See the creation
+                                // gate around line 2637 for the matching condition.
+                                const bool n_swa_active_recovery = llama_model_n_swa(model) > 0 && !params_base.swa_full;
+                                const bool may_have_checkpoints =
+                                        slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL
+                                        || slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART_BOUNDED
+                                        || n_swa_active_recovery
+                                        || llama_model_is_recurrent(model)
+                                        || llama_model_is_hybrid(model);
+
+                                if (may_have_checkpoints && pos_min >= pos_min_thold) {
                                     SLT_WRN(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d, n_swa = %d\n", n_past, (int) slot.prompt.tokens.size(), slot.id, pos_min, n_swa);
 
                                     // search for a context checkpoint
