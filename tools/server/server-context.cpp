@@ -2593,8 +2593,12 @@ private:
                                     }
 
                                     if (do_reset) {
-                                        SLT_WRN(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
-                                                "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
+                                        // Reaching this means checkpoints were created (may_have_checkpoints == true)
+                                        // but none had a low-enough pos_min to cover the SWA window — the cache really
+                                        // is stale for this slot and we must re-prefill. The empty-checkpoint case
+                                        // (e.g. --swa-full or non-SWA dense models) is filtered out by the gate above.
+                                        SLT_WRN(slot, "forcing full prompt re-processing: no checkpoint covers the SWA window for this slot (n_past = %d, pos_min = %d, n_swa = %d, checkpoints = %zu)\n",
+                                                n_past, pos_min, n_swa, slot.prompt.checkpoints.size());
                                         pos_next = 0;
                                         n_past = 0;
                                     }
