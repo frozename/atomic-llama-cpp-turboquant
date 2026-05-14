@@ -78,6 +78,9 @@ struct server_context {
     // not thread-safe, should only be used from the main thread
     server_context_meta get_meta() const;
 
+    // log speculative lookup cache counters (used by teardown path)
+    void log_speculative_counters() const;
+
     // register a callback to be called when sleeping state changes
     // must be set before load_model() is called
     void on_sleeping_changed(std::function<void(bool)> callback);

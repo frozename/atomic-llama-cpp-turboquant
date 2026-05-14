@@ -89,7 +89,7 @@ int main(int argc, char ** argv){
 
             {
                 const int64_t t_start_draft_us = ggml_time_us();
-                common_ngram_cache_draft(pseudo_output, draft, n_draft, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, ngram_cache_context, ngram_cache_dynamic, ngram_cache_static);
+                common_ngram_cache_draft(pseudo_output, draft, n_draft, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, ngram_cache_context, ngram_cache_dynamic, nullptr, ngram_cache_static);
                 t_draft_us += ggml_time_us() - t_start_draft_us;
             }
 

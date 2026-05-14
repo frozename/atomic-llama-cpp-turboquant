@@ -18,7 +18,9 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <atomic>
 #include <exception>
+#include <optional>
 #include <memory>
 #include <filesystem>
 #include <utility>
@@ -77,7 +79,25 @@ enum server_state {
     SERVER_STATE_READY,          // Server is ready and model is loaded
 };
 
+struct server_slot_speculative_counters {
+    std::atomic<uint64_t> n_draft_tokens_total = 0;      // Total draft tokens generated
+    std::atomic<uint64_t> n_draft_tokens_accepted = 0;   // Draft tokens actually accepted
+    std::atomic<uint64_t> n_lookup_context_hits = 0;     // Context-cache hits
+    std::atomic<uint64_t> n_lookup_dynamic_hits = 0;     // Shared dynamic-cache hits
+    std::atomic<uint64_t> n_lookup_static_hits = 0;      // Static-cache hits
+
+    void reset() {
+        // Per-request counters reported by server_slot::print_timing().
+        // Lookup-hit counters are lifetime; not reset on slot release so that
+        // server_context::log_speculative_counters() at shutdown reflects the
+        // slot's full session.
+    }
+};
+
 struct server_slot {
+    server_slot()
+        : speculative_counters(std::make_unique<server_slot_speculative_counters>()) {}
+
     int id;
 
     llama_context * ctx = nullptr;
@@ -190,8 +210,17 @@ struct server_slot {
     std::function<void(int /* id_slot */)> callback_on_release;
 
     // Speculative decoding stats
-    int32_t n_draft_total = 0;      // Total draft tokens generated
-    int32_t n_draft_accepted = 0;   // Draft tokens actually accepted
+    std::unique_ptr<server_slot_speculative_counters> speculative_counters;
+
+    server_slot_speculative_counters & speculative_counters_ref() {
+        GGML_ASSERT(speculative_counters);
+        return *speculative_counters;
+    }
+
+    const server_slot_speculative_counters & speculative_counters_ref() const {
+        GGML_ASSERT(speculative_counters);
+        return *speculative_counters;
+    }
 
     void reset() {
         SLT_DBG(*this, "%s", "\n");
@@ -216,8 +245,7 @@ struct server_slot {
         json_schema = json();
 
         // clear speculative decoding stats
-        n_draft_total = 0;
-        n_draft_accepted = 0;
+        speculative_counters_ref().reset();
 
         task_prev = std::move(task);
         task.reset();
@@ -354,8 +382,13 @@ struct server_slot {
                 GGML_ASSERT(spec_i_batch.empty());
 
                 // generate a new draft
-                spec_draft = common_speculative_draft(spec.get(), params_spec, tokens, sampled);
-                n_draft_total += spec_draft.size();
+                common_ngram_cache_draft_stats lookup_stats;
+                auto & counters = speculative_counters_ref();
+                spec_draft = common_speculative_draft(spec.get(), params_spec, tokens, sampled, &lookup_stats);
+                counters.n_draft_tokens_total.fetch_add(spec_draft.size(), std::memory_order_relaxed);
+                counters.n_lookup_context_hits.fetch_add(lookup_stats.n_lookup_context_hits, std::memory_order_relaxed);
+                counters.n_lookup_dynamic_hits.fetch_add(lookup_stats.n_lookup_dynamic_hits, std::memory_order_relaxed);
+                counters.n_lookup_static_hits.fetch_add(lookup_stats.n_lookup_static_hits, std::memory_order_relaxed);
 
                 if (spec_draft.size() > (size_t) n_draft_max) {
                     SLT_WRN(*this, "draft size %d exceeds max %d, truncating\n", (int) spec_draft.size(), n_draft_max);
@@ -448,9 +481,11 @@ struct server_slot {
         timings.predicted_per_second   = 1e3 / t_token_generation * n_decoded;
 
         // Add speculative metrics
-        if (n_draft_total > 0) {
-            timings.draft_n          = n_draft_total;
-            timings.draft_n_accepted = n_draft_accepted;
+        const auto draft_tokens_total = speculative_counters_ref().n_draft_tokens_total.load(std::memory_order_relaxed);
+        const auto draft_tokens_accepted = speculative_counters_ref().n_draft_tokens_accepted.load(std::memory_order_relaxed);
+        if (draft_tokens_total > 0) {
+            timings.draft_n          = (int32_t) draft_tokens_total;
+            timings.draft_n_accepted = (int32_t) draft_tokens_accepted;
         }
 
         return timings;
@@ -503,11 +538,13 @@ struct server_slot {
                 t_token_generation, n_decoded, t_gen, n_gen_second,
                 t_prompt_processing + t_token_generation, n_prompt_tokens_processed + n_decoded);
 
-        if (n_draft_total > 0) {
-            const float draft_ratio = (float) n_draft_accepted / n_draft_total;
+        const auto draft_tokens_total = speculative_counters_ref().n_draft_tokens_total.load(std::memory_order_relaxed);
+        const auto draft_tokens_accepted = speculative_counters_ref().n_draft_tokens_accepted.load(std::memory_order_relaxed);
+        if (draft_tokens_total > 0) {
+            const float draft_ratio = (float) draft_tokens_accepted / (float) draft_tokens_total;
             SLT_CNT(*this,
-                    "draft acceptance rate = %0.5f (%5d accepted / %5d generated)\n",
-                    draft_ratio, n_draft_accepted, n_draft_total
+                    "draft acceptance rate = %0.5f (%5" PRIu64 " accepted / %5" PRIu64 " generated)\n",
+                    draft_ratio, draft_tokens_accepted, draft_tokens_total
             );
         }
 
@@ -705,6 +742,8 @@ private:
 
     bool sleeping = false;
 
+    std::optional<common_ngram_cache_shared> shared_lookup_cache_dynamic;
+
     void destroy() {
         llama_init.reset();
 
@@ -871,6 +910,20 @@ private:
         // setup slots
         SRV_INF("initializing slots, n_slots = %d\n", params_base.n_parallel);
 
+        if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_NGRAM_CACHE &&
+                !params_base.speculative.ngram_cache.lookup_cache_dynamic.empty()) {
+            shared_lookup_cache_dynamic.emplace();
+            try {
+                shared_lookup_cache_dynamic->cache = common_ngram_cache_load(
+                        params_base.speculative.ngram_cache.lookup_cache_dynamic
+                );
+            } catch (...) {
+                LOG_ERR("failed to open dynamic lookup cache for shared mode: %s",
+                        params_base.speculative.ngram_cache.lookup_cache_dynamic.c_str());
+                GGML_ABORT("Couldn't read dynamic lookup cache");
+            }
+        }
+
         const int n_ctx_train = llama_model_n_ctx_train(model);
 
         int n_ctx_slot = llama_n_ctx_seq(ctx);
@@ -909,9 +962,19 @@ private:
 
             // try speculative decoding
             if (ctx_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
-                slot.spec.reset(common_speculative_init(params_base.speculative, slot.ctx));
+                auto params_spec = params_base.speculative;
+                if (params_spec.type == COMMON_SPECULATIVE_TYPE_NGRAM_CACHE &&
+                        !params_spec.ngram_cache.lookup_cache_dynamic.empty() &&
+                        shared_lookup_cache_dynamic.has_value()) {
+                    params_spec.ngram_cache.lookup_cache_dynamic.clear();
+                }
+
+                slot.spec.reset(common_speculative_init(params_spec, slot.ctx));
 
                 if (slot.spec) {
+                    if (shared_lookup_cache_dynamic.has_value()) {
+                        common_speculative_set_shared_dynamic_cache(slot.spec.get(), &shared_lookup_cache_dynamic.value());
+                    }
                     SLT_INF(slot, "%s", "speculative decoding context initialized\n");
                 }
             }
@@ -3046,7 +3109,7 @@ private:
                 slot.t_token_generation = std::max<int64_t>(1, t_current - slot.t_start_generation) / 1e3;
 
                 // update how many tokens out of those tested were accepted
-                slot.n_draft_accepted += ids.size() - 1;
+                slot.speculative_counters_ref().n_draft_tokens_accepted.fetch_add(ids.size() - 1, std::memory_order_relaxed);
 
                 // add accepted tokens to the prompt
                 slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - n_draft);
@@ -3114,6 +3177,27 @@ void server_context::terminate() {
 
 llama_context * server_context::get_llama_context() const {
     return impl->ctx;
+}
+
+void server_context::log_speculative_counters() const {
+    for (const auto & slot : impl->slots) {
+        const auto n_draft_tokens_total = slot.speculative_counters_ref().n_draft_tokens_total.load(std::memory_order_relaxed);
+        const auto n_draft_tokens_accepted = slot.speculative_counters_ref().n_draft_tokens_accepted.load(std::memory_order_relaxed);
+        const auto n_lookup_context_hits = slot.speculative_counters_ref().n_lookup_context_hits.load(std::memory_order_relaxed);
+        const auto n_lookup_dynamic_hits = slot.speculative_counters_ref().n_lookup_dynamic_hits.load(std::memory_order_relaxed);
+        const auto n_lookup_static_hits = slot.speculative_counters_ref().n_lookup_static_hits.load(std::memory_order_relaxed);
+
+        LOG_INF(
+                "slot %d speculative counters: n_draft_tokens_total=%" PRIu64 ", n_draft_tokens_accepted=%" PRIu64
+                ", n_lookup_context_hits=%" PRIu64 ", n_lookup_dynamic_hits=%" PRIu64 ", n_lookup_static_hits=%" PRIu64,
+                slot.id,
+                n_draft_tokens_total,
+                n_draft_tokens_accepted,
+                n_lookup_context_hits,
+                n_lookup_dynamic_hits,
+                n_lookup_static_hits
+        );
+    }
 }
 
 server_response_reader server_context::get_response_reader() {

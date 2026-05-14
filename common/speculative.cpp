@@ -148,9 +148,12 @@ struct common_speculative_state {
             const common_params_speculative & params,
             const llama_tokens & prompt_tgt,
             llama_token id_last,
-            llama_tokens & result) = 0;
+            llama_tokens & result,
+            common_ngram_cache_draft_stats * lookup_stats) = 0;
 
     virtual void accept(uint16_t n_accepted) = 0;
+
+    virtual void set_shared_dynamic_cache(common_ngram_cache_shared *) {}
 
     virtual int32_t n_max(const common_params_speculative & params) const = 0;
     virtual int32_t n_min(const common_params_speculative & params) const = 0;
@@ -286,7 +289,9 @@ struct common_speculative_state_draft : public common_speculative_state {
             const common_params_speculative & params,
             const llama_tokens & prompt_tgt,
             llama_token id_last,
-            llama_tokens & result) override {
+            llama_tokens & result,
+            common_ngram_cache_draft_stats * lookup_stats) override {
+        GGML_UNUSED(lookup_stats);
         const auto & sparams = params.draft;
 
         auto * spec = this;
@@ -577,12 +582,14 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
             const common_params_speculative & params,
             const llama_tokens & prompt_tgt,
             llama_token id_last,
-            llama_tokens & draft_tokens) override {
+            llama_tokens & draft_tokens,
+            common_ngram_cache_draft_stats * lookup_stats) override {
         // TODO: implement
         GGML_UNUSED(params);
         GGML_UNUSED(prompt_tgt);
         GGML_UNUSED(id_last);
         GGML_UNUSED(draft_tokens);
+        GGML_UNUSED(lookup_stats);
     }
 
     void accept(uint16_t n_accepted) override {
@@ -616,10 +623,12 @@ struct common_speculative_state_ngram_simple : public common_speculative_state {
             const common_params_speculative & params,
             const llama_tokens & prompt_tgt,
             llama_token id_last,
-            llama_tokens & result) override {
+            llama_tokens & result,
+            common_ngram_cache_draft_stats * lookup_stats) override {
 
         result = common_ngram_simple_draft(config, prompt_tgt, id_last);
         GGML_UNUSED(params);
+        GGML_UNUSED(lookup_stats);
     }
 
     void accept(uint16_t n_accepted) override {
@@ -653,9 +662,11 @@ struct common_speculative_state_ngram_map_k : public common_speculative_state {
             const common_params_speculative & params,
             const llama_tokens & prompt_tgt,
             llama_token id_last,
-            llama_tokens & result) override {
+            llama_tokens & result,
+            common_ngram_cache_draft_stats * lookup_stats) override {
         common_ngram_map_draft(config, prompt_tgt, id_last, result);
         GGML_UNUSED(params);
+        GGML_UNUSED(lookup_stats);
     }
 
     void accept(uint16_t n_accepted) override {
@@ -723,7 +734,8 @@ struct common_speculative_state_ngram_mod : public common_speculative_state {
             const common_params_speculative & params,
             const llama_tokens & prompt_tgt,
             llama_token id_last,
-            llama_tokens & result) override {
+            llama_tokens & result,
+            common_ngram_cache_draft_stats * lookup_stats) override {
         const auto & sparams = params.ngram_mod;
 
         n_draft_last = 0;
@@ -772,6 +784,8 @@ struct common_speculative_state_ngram_mod : public common_speculative_state {
 
         // store length of drafted n‑gram for later acceptance analysis
         n_draft_last = result.size();
+
+        GGML_UNUSED(lookup_stats);
     }
 
     void accept(uint16_t n_accepted) override {
@@ -808,11 +822,13 @@ struct common_speculative_state_ngram_cache : public common_speculative_state {
     uint16_t n_draft;
     bool save_dynamic;
     bool save_static;
+    common_ngram_cache_shared * shared_dynamic = nullptr;
 
     common_ngram_cache ngram_cache_context;
     common_ngram_cache ngram_cache_dynamic;
     common_ngram_cache ngram_cache_static;
 
+    llama_tokens last_draft;
     size_t cache_size = 0; // number of tokens in n-gram cache
 
     common_speculative_state_ngram_cache(
@@ -854,7 +870,8 @@ struct common_speculative_state_ngram_cache : public common_speculative_state {
             const common_params_speculative & params,
             const llama_tokens & prompt_tgt,
             llama_token id_last,
-            llama_tokens & result) override {
+            llama_tokens & result,
+            common_ngram_cache_draft_stats * lookup_stats) override {
         GGML_UNUSED(params);
 
         if (cache_size < prompt_tgt.size() + 1) {
@@ -883,17 +900,50 @@ struct common_speculative_state_ngram_cache : public common_speculative_state {
         common_ngram_cache_draft(inp, result, n_draft, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX,
                 ngram_cache_context,
                 ngram_cache_dynamic,
-                ngram_cache_static);
+                shared_dynamic,
+                ngram_cache_static,
+                lookup_stats);
 
         if (result.size() > 0) {
             // delete first token in result (which is the id_last token)
             result.erase(result.begin());
         }
+
+        last_draft = result;
     }
 
     void accept(uint16_t n_accepted) override {
-        // TODO: noop
-        GGML_UNUSED(n_accepted);
+        if (n_accepted == 0 || last_draft.empty()) {
+            return;
+        }
+
+        const size_t n_new = std::min<size_t>(n_accepted, last_draft.size());
+        if (n_new == 0) {
+            return;
+        }
+
+        llama_tokens tokens_new;
+        tokens_new.reserve(n_new);
+        for (size_t j = 0; j < n_new; ++j) {
+            tokens_new.push_back(last_draft[j]);
+        }
+
+        common_ngram_cache_update(ngram_cache_context, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, tokens_new, n_new, false);
+
+        if (shared_dynamic != nullptr) {
+            std::unique_lock<std::shared_mutex> lock(shared_dynamic->mutex);
+
+            shared_dynamic->update_tail.insert(shared_dynamic->update_tail.end(), tokens_new.begin(), tokens_new.end());
+            common_ngram_cache_update(shared_dynamic->cache, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, shared_dynamic->update_tail, n_new, false);
+            return;
+        }
+
+        common_ngram_cache_update(ngram_cache_dynamic, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, tokens_new, n_new, false);
+
+    }
+
+    void set_shared_dynamic_cache(common_ngram_cache_shared * shared_cache) override {
+        shared_dynamic = shared_cache;
     }
 
     int32_t n_max(const common_params_speculative & /*params*/) const override {
@@ -1111,6 +1161,18 @@ common_speculative * common_speculative_init(
     return result;
 }
 
+void common_speculative_set_shared_dynamic_cache(
+        common_speculative * spec,
+        common_ngram_cache_shared * shared_dynamic) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    for (auto & impl : spec->impls) {
+        impl->set_shared_dynamic_cache(shared_dynamic);
+    }
+}
+
 void common_speculative_free(common_speculative * spec) {
     if (spec == nullptr) {
         return;
@@ -1135,7 +1197,8 @@ llama_tokens common_speculative_draft(
         common_speculative * spec,
         const common_params_speculative & params,
         const llama_tokens & prompt_tgt, // specified in target model vocab
-        llama_token id_last) {
+        llama_token id_last,
+        common_ngram_cache_draft_stats * lookup_stats) {
     llama_tokens result;
 
     spec->curr_impl = nullptr; // reset current implementation
@@ -1143,8 +1206,15 @@ llama_tokens common_speculative_draft(
     for (auto & impl : spec->impls) {
         {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
-            impl->draft(params, prompt_tgt, id_last, result);
+            common_ngram_cache_draft_stats draft_stats;
+            impl->draft(params, prompt_tgt, id_last, result, lookup_stats ? &draft_stats : nullptr);
             impl->n_call_draft++;
+
+            if (lookup_stats != nullptr) {
+                lookup_stats->n_lookup_context_hits += draft_stats.n_lookup_context_hits;
+                lookup_stats->n_lookup_dynamic_hits += draft_stats.n_lookup_dynamic_hits;
+                lookup_stats->n_lookup_static_hits += draft_stats.n_lookup_static_hits;
+            }
         }
 
         {

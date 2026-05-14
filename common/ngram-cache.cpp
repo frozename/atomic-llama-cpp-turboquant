@@ -8,6 +8,7 @@
 #include <fstream>
 #include <thread>
 #include <algorithm>
+#include <shared_mutex>
 
 void common_ngram_cache_update(common_ngram_cache & ngram_cache, int ngram_min, int ngram_max,
                               std::vector<llama_token> & inp, int nnew, bool print_progress) {
@@ -145,7 +146,8 @@ static llama_token try_draft(
 
 void common_ngram_cache_draft(
     std::vector<llama_token> & inp, std::vector<llama_token> & draft, int n_draft, int ngram_min, int ngram_max,
-    common_ngram_cache & nc_context, common_ngram_cache & nc_dynamic, common_ngram_cache & nc_static
+    common_ngram_cache & nc_context, common_ngram_cache & nc_dynamic, common_ngram_cache_shared * nc_dynamic_shared,
+    common_ngram_cache & nc_static, common_ngram_cache_draft_stats * stats
 ) {
     GGML_ASSERT(draft.size() == 1);
     const int inp_size = inp.size();
@@ -180,12 +182,27 @@ void common_ngram_cache_draft(
         }
         if (drafted_token == LLAMA_TOKEN_NULL) {
             drafted_token = try_draft(nc_context, ngrams_cd, part_static, draft_min_sample_size_lax, draft_min_percent_lax);
+            if (stats != nullptr && drafted_token != LLAMA_TOKEN_NULL) {
+                ++stats->n_lookup_context_hits;
+            }
         }
         if (drafted_token == LLAMA_TOKEN_NULL) {
-            drafted_token = try_draft(nc_dynamic, ngrams_cd, part_static, draft_min_sample_size_strict, draft_min_percent_strict);
+            if (nc_dynamic_shared != nullptr) {
+                std::shared_lock<std::shared_mutex> lock(nc_dynamic_shared->mutex);
+                drafted_token = try_draft(nc_dynamic_shared->cache, ngrams_cd, part_static,
+                        draft_min_sample_size_strict, draft_min_percent_strict);
+            } else {
+                drafted_token = try_draft(nc_dynamic, ngrams_cd, part_static, draft_min_sample_size_strict, draft_min_percent_strict);
+            }
+            if (stats != nullptr && drafted_token != LLAMA_TOKEN_NULL) {
+                ++stats->n_lookup_dynamic_hits;
+            }
         }
         if (drafted_token == LLAMA_TOKEN_NULL) {
             drafted_token = try_draft(nc_static, ngram_static);
+            if (stats != nullptr && drafted_token != LLAMA_TOKEN_NULL) {
+                ++stats->n_lookup_static_hits;
+            }
         }
 
         if (drafted_token == LLAMA_TOKEN_NULL) {
