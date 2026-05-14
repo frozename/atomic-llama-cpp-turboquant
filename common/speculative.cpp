@@ -931,10 +931,14 @@ struct common_speculative_state_ngram_cache : public common_speculative_state {
         common_ngram_cache_update(ngram_cache_context, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, tokens_new, n_new, false);
 
         if (shared_dynamic != nullptr) {
+            // Build ngrams from THIS slot's accepted tokens only, then merge
+            // into the shared cache under a brief exclusive lock. Using a
+            // shared concatenated tail across all slots would record n-grams
+            // that span request boundaries (slot A's last token followed by
+            // slot B's first), which never occur in a real sequence; it would
+            // also grow unbounded for long-lived servers.
             std::unique_lock<std::shared_mutex> lock(shared_dynamic->mutex);
-
-            shared_dynamic->update_tail.insert(shared_dynamic->update_tail.end(), tokens_new.begin(), tokens_new.end());
-            common_ngram_cache_update(shared_dynamic->cache, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, shared_dynamic->update_tail, n_new, false);
+            common_ngram_cache_update(shared_dynamic->cache, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, tokens_new, n_new, false);
             return;
         }
 

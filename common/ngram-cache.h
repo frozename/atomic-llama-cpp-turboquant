@@ -68,7 +68,8 @@ struct common_ngram_cache_draft_stats {
 };
 
 struct common_ngram_cache_shared {
-    std::vector<llama_token> update_tail;
+    // Reader/writer mutex: slot draft() paths take a shared lock to query
+    // `cache`; slot accept() paths take a brief unique lock to merge.
     mutable std::shared_mutex mutex;
 
     common_ngram_cache cache;
