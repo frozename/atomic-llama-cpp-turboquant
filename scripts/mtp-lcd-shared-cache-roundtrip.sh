@@ -4,10 +4,15 @@ set -euo pipefail
 UNPATCHED_BIN="${1:-/Volumes/WorkSSD/src/llama.cpp/build/bin/llama-server}"
 PATCHED_BIN="${2:-/Volumes/WorkSSD/src/llama.cpp-atomic/build-shared-cache/bin/llama-server}"
 MODEL_PATH="${3:-/Volumes/WorkSSD/ai-models/llama.cpp/models/granite-4.1-3b-GGUF/granite-4.1-3b-Q6_K.gguf}"
+
 PORT=18888
 PORT_STEP=1
 N_PROMPTS=24
-PROMPT='{"model":"local","messages":[{"role":"user","content":"Say the sequence: A A A A A A A A"}],"max_tokens":20}'
+WARMUP_PROMPTS=(
+  '{"model":"local","messages":[{"role":"user","content":"Say the sequence: A B C D E F G A B C D E F G"}],"max_tokens":64}'
+  '{"model":"local","messages":[{"role":"user","content":"Say the sequence: 1 2 3 4 5 6 7 8 9 10"}],"max_tokens":64}'
+)
+PROMPT_TEMPLATE='{"model":"local","messages":[{"role":"user","content":"Now repeat exactly what you wrote in the same sequence pattern from the sequence: A B C D E F G; keep going until 20 tokens."}],"max_tokens":64}'
 
 log() {
   echo "[mtp-lcd-roundtrip] $*" >&2
@@ -20,7 +25,9 @@ run_server_once() {
   local pid_file="$4"
   local port="$5"
 
-  : > "$cache_file"
+  > "$cache_file"
+  > "${cache_file}0"
+  > "${cache_file}1"
 
   "$binary" \
     --model "$MODEL_PATH" \
@@ -34,7 +41,7 @@ run_server_once() {
   local pid=$!
   echo "$pid" > "$pid_file"
 
-  for _ in $(seq 1 120); do
+  for _ in $(seq 1 180); do
     if curl -fsS "http://127.0.0.1:${port}/health" >/dev/null; then
       return 0
     fi
@@ -44,27 +51,45 @@ run_server_once() {
   return 1
 }
 
+send_with_retry() {
+  local url="$1"
+  local body="$2"
+
+  for _ in $(seq 1 30); do
+    if curl -fsS -X POST "$url" \
+      -H 'Content-Type: application/json' \
+      -d "$body" >/dev/null; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  return 1
+}
+
 send_prompts() {
   local port="$1"
+  local warmup_requests="$2"
   local i
   local pids=()
   local max_parallel=2
 
-  send_with_retry() {
-    local url="$1"
-    for _ in $(seq 1 30); do
-      if curl -fsS -X POST "$url" \
-        -H 'Content-Type: application/json' \
-        -d "$PROMPT" >/dev/null; then
-        return 0
-      fi
-      sleep 0.25
-    done
-    return 1
-  }
+  for i in $(seq 1 "$warmup_requests"); do
+    local body="${WARMUP_PROMPTS[$(( (i - 1) % ${#WARMUP_PROMPTS[@]} ))]}"
+    send_with_retry "http://127.0.0.1:${port}/v1/chat/completions" "$body" &
+    pids+=("$!")
+    if (( ${#pids[@]} >= max_parallel )); then
+      wait "${pids[0]}"
+      pids=("${pids[@]:1}")
+    fi
+  done
 
-  for i in $(seq 1 "$N_PROMPTS"); do
-    send_with_retry "http://127.0.0.1:${port}/v1/chat/completions" &
+  local main_requests=$((N_PROMPTS - warmup_requests))
+  if (( main_requests < 0 )); then
+    main_requests=0
+  fi
+
+  for i in $(seq 1 "$main_requests"); do
+    send_with_retry "http://127.0.0.1:${port}/v1/chat/completions" "$PROMPT_TEMPLATE" &
     pids+=("$!")
     if (( ${#pids[@]} >= max_parallel )); then
       wait "${pids[0]}"
@@ -95,13 +120,14 @@ run_case() {
   local binary="$1"
   local label="$2"
   local port="$3"
+  local warmup="$4"
   local log_file
   local cache_file
   local pid_file
   local pid
 
   log_file="/tmp/mtp-lcd-roundtrip-${label}.log"
-  cache_file="$(mktemp)"
+  cache_file="$(mktemp /tmp/mtp-lcd-roundtrip-cache-XXXXXX.bin)"
   pid_file="$(mktemp)"
   slot0_hits="missing"
   slot1_hits="missing"
@@ -111,6 +137,7 @@ run_case() {
     echo "${label} server failed to become healthy; log: ${log_file}" >&2
     echo "----- ${label} server log -----" >&2
     cat "$log_file" >&2
+    rm -f "$pid_file" "$cache_file" "${cache_file}0" "${cache_file}1"
     exit 1
   }
   pid="$(cat "$pid_file")"
@@ -119,10 +146,11 @@ run_case() {
     echo "${label} server process exited early; log: ${log_file}" >&2
     echo "----- ${label} server log -----" >&2
     cat "$log_file" >&2
+    rm -f "$pid_file" "$cache_file" "${cache_file}0" "${cache_file}1"
     exit 1
   fi
 
-  send_prompts "$port"
+  send_prompts "$port" "$warmup"
 
   kill "$pid" >/dev/null 2>&1 || true
   wait "$pid" >/dev/null 2>&1 || true
@@ -130,7 +158,7 @@ run_case() {
   slot0_hits="$(parse_slot_hit_count "$log_file" 0)"
   slot1_hits="$(parse_slot_hit_count "$log_file" 1)"
 
-  rm -f "$pid_file" "$cache_file"
+  rm -f "$pid_file" "$cache_file" "${cache_file}0" "${cache_file}1"
 
   echo "$slot0_hits $slot1_hits"
 }
@@ -138,7 +166,7 @@ run_case() {
 BASELINE_PORT="$PORT"
 PATCHED_PORT=$((PORT + PORT_STEP))
 
-BASELINE_HITS="$(run_case "$UNPATCHED_BIN" "unpatched" "$BASELINE_PORT")"
+BASELINE_HITS="$(run_case "$UNPATCHED_BIN" "unpatched" "$BASELINE_PORT" 24)"
 log "baseline counter values: ${BASELINE_HITS}"
 
 if [ "$BASELINE_HITS" != "missing missing" ] \
@@ -149,7 +177,7 @@ if [ "$BASELINE_HITS" != "missing missing" ] \
   exit 1
 fi
 
-PATCHED_HITS="$(run_case "$PATCHED_BIN" "patched" "$PATCHED_PORT")"
+PATCHED_HITS="$(run_case "$PATCHED_BIN" "patched" "$PATCHED_PORT" 16)"
 log "patched counter values: ${PATCHED_HITS}"
 
 set -- $PATCHED_HITS
