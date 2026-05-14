@@ -2,8 +2,10 @@
 
 #include "llama.h"
 #include "common.h"
+#include "ngram-cache.h"
 
 struct common_speculative;
+struct common_ngram_cache_draft_stats;
 
 // comma separated list of all types
 std::string common_speculative_type_name_str();
@@ -23,12 +25,18 @@ void common_speculative_free(common_speculative * spec);
 // optionally call once at the beginning of a new generation
 void common_speculative_begin(common_speculative * spec, const llama_tokens & prompt);
 
+// Set a shared dynamic cache for n-gram speculative decoding.
+void common_speculative_set_shared_dynamic_cache(
+        common_speculative * spec,
+        common_ngram_cache_shared * shared_dynamic);
+
 // sample up to n_draft tokens and add them to the batch using the draft model
 llama_tokens common_speculative_draft(
                      common_speculative * spec,
         const common_params_speculative & params,
                      const llama_tokens & prompt,
-                            llama_token   id_last);
+                            llama_token   id_last,
+                            common_ngram_cache_draft_stats * lookup_stats = nullptr);
 
 // informs the speculative decoder that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, uint16_t n_accepted);

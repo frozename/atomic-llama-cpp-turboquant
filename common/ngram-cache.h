@@ -5,6 +5,7 @@
 #include <unordered_map>
 #include <string>
 #include <vector>
+#include <shared_mutex>
 
 #define LLAMA_NGRAM_MIN    1
 #define LLAMA_NGRAM_MAX    4
@@ -60,6 +61,19 @@ typedef std::unordered_map<llama_token, int32_t> common_ngram_cache_part;
 // n-gram -> empirical distribution of following tokens
 typedef std::unordered_map<common_ngram, common_ngram_cache_part, common_ngram_hash_function> common_ngram_cache;
 
+struct common_ngram_cache_draft_stats {
+    size_t n_lookup_context_hits = 0;
+    size_t n_lookup_dynamic_hits = 0;
+    size_t n_lookup_static_hits = 0;
+};
+
+struct common_ngram_cache_shared {
+    std::vector<llama_token> update_tail;
+    mutable std::shared_mutex mutex;
+
+    common_ngram_cache cache;
+};
+
 
 // Update an ngram cache with tokens.
 // ngram_cache:         the cache to modify.
@@ -83,7 +97,9 @@ void common_ngram_cache_update(
 // nc_static:          ngram cache generated from a large text corpus, used for validation.
 void common_ngram_cache_draft(
     std::vector<llama_token> & inp, std::vector<llama_token> & draft, int n_draft, int ngram_min, int ngram_max,
-    common_ngram_cache & nc_context, common_ngram_cache & nc_dynamic, common_ngram_cache & nc_static);
+    common_ngram_cache & nc_context, common_ngram_cache & nc_dynamic, common_ngram_cache_shared * nc_dynamic_shared,
+    common_ngram_cache & nc_static,
+    common_ngram_cache_draft_stats * stats = nullptr);
 
 // Save an ngram cache to a file.
 // ngram_cache: the ngram cache to save.

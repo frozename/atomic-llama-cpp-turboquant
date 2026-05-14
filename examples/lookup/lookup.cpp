@@ -194,7 +194,7 @@ int main(int argc, char ** argv){
         GGML_ASSERT(draft[0] == inp.back());
         const int64_t t_start_draft_us = ggml_time_us();
 
-        common_ngram_cache_draft(inp, draft, n_draft, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, ngram_cache_context, ngram_cache_dynamic, ngram_cache_static);
+        common_ngram_cache_draft(inp, draft, n_draft, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX, ngram_cache_context, ngram_cache_dynamic, nullptr, ngram_cache_static);
 
         for (size_t i = 1; i < draft.size(); ++i) {
             common_batch_add(batch_tgt, draft[i], n_past + i, { 0 }, true);
