@@ -529,6 +529,27 @@ private:
                                 i++;
                                 literal += sub_pattern[i];
                                 i++;
+                            } else if (next == 'd' || next == 'D' || next == 's' || next == 'S' || next == 'w' || next == 'W') {
+                                // regex-char-class-shorthand patch:
+                                // GBNF's parser does not recognise \d/\D/\s/\S/\w/\W. Translate
+                                // each shorthand into the equivalent character class and emit it as
+                                // a non-literal sub-rule so it doesn't get re-quoted as a string.
+                                if (!literal.empty()) {
+                                    seq.emplace_back(literal, true);
+                                    literal.clear();
+                                }
+                                const char * cls;
+                                switch (next) {
+                                    case 'd': cls = "[0-9]";                break;
+                                    case 'D': cls = "[^0-9]";               break;
+                                    case 's': cls = "[ \\t\\n\\r\\f\\v]";   break;
+                                    case 'S': cls = "[^ \\t\\n\\r\\f\\v]";  break;
+                                    case 'w': cls = "[A-Za-z0-9_]";         break;
+                                    case 'W': cls = "[^A-Za-z0-9_]";        break;
+                                    default:  cls = "";                    break;
+                                }
+                                seq.emplace_back(cls, false);
+                                i += 2;
                             } else {
                                 literal += sub_pattern.substr(i, 2);
                                 i += 2;
