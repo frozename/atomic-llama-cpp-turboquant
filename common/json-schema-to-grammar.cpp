@@ -542,8 +542,8 @@ private:
                                 switch (next) {
                                     case 'd': cls = "[0-9]";                break;
                                     case 'D': cls = "[^0-9]";               break;
-                                    case 's': cls = "[ \\t\\n\\r\\f\\v]";   break;
-                                    case 'S': cls = "[^ \\t\\n\\r\\f\\v]";  break;
+                                    case 's': cls = "[ \\t\\n\\r\\x0C\\x0B]"; break;
+                                    case 'S': cls = "[^ \\t\\n\\r\\x0C\\x0B]"; break;
                                     case 'w': cls = "[A-Za-z0-9_]";         break;
                                     case 'W': cls = "[^A-Za-z0-9_]";        break;
                                     default:  cls = "";                    break;
